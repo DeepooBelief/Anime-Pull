@@ -10,6 +10,7 @@ from torrentool.api import Torrent
 async def main():
     client = PikPakApi(username=EMAIL, password=PW)
     await client.login()
+    await client.refresh_access_token()
 
     async def get_or_create_folder(parent_id, folder_name):
         folder_name = sanitize_folder_name(folder_name)
