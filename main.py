@@ -4,13 +4,33 @@ import csv
 import re
 import aiohttp
 from pikpakapi import PikPakApi
-from info import EMAIL, PW
+from info import EMAIL, PW, PUSHPLUS_TOKEN
 from torrentool.api import Torrent
+import requests
+
+
+async def notify(title, content):
+    """Send notification via Pushplus service"""
+    if not PUSHPLUS_TOKEN:
+        return
+    
+    url = f'http://www.pushplus.plus/send?token={PUSHPLUS_TOKEN}&title={title}&content={content}'
+    try:
+        response = requests.get(url)
+        if response.status_code == 200:
+            print(f"通知已发送: {title}")
+        else:
+            print(f"通知发送失败: {response.status_code}")
+    except Exception as e:
+        print(f"通知发送异常: {e}")
+
 
 async def main():
     client = PikPakApi(username=EMAIL, password=PW)
     await client.login()
     await client.refresh_access_token()
+    
+    added_files = []  # Track newly added files for notification
 
     async def get_or_create_folder(parent_id, folder_name):
         folder_name = sanitize_folder_name(folder_name)
@@ -76,18 +96,30 @@ async def main():
                 print(f"检查文件存在失败: {e}")
                 return
 
-            try:
-                task = await client.offline_download(
-                    bt_url,
-                    parent_id=target_folder_id
-                )
-                print(f"已添加到 /Anime/{title}: {file_name}")
-            except Exception as e:
-                print(f"失败: {e}")
+            async def retry_offline_download(bt_url, parent_id, retries=3):
+                for attempt in range(retries):
+                    try:
+                        task = await client.offline_download(bt_url, parent_id=parent_id)
+                        print(f"已添加到 /Anime/{title}: {file_name}")
+                        # Add to the list of added files for notification
+                        added_files.append(f"[{title}] {file_name}")
+                        return
+                    except Exception as e:
+                        print(f"失败 (尝试 {attempt + 1}/{retries}): {e}")
+                        if attempt + 1 == retries:
+                            print(f"最终失败: {e}")
+
+            await retry_offline_download(bt_url, target_folder_id)
 
         await asyncio.gather(*(process_entry(entry) for entry in feed.entries))
 
     await asyncio.gather(*(process_rss(title, rss_url) for title, rss_url in rss_data))
+    
+    # Send notification for all added files
+    if added_files:
+        notification_title = f"新添加了 {len(added_files)} 个动漫文件"
+        notification_content = "\n".join(added_files)
+        await notify(notification_title, notification_content)
 
 if __name__ == "__main__":
     asyncio.run(main())
