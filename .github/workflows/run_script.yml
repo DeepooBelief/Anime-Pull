@@ -30,6 +30,7 @@ jobs:
       run: |
         echo "EMAIL = '${{ secrets.PIKPAK_EMAIL }}'" > info.py
         echo "PW = '${{ secrets.PIKPAK_PASSWORD }}'" >> info.py
+        echo "PUSHPLUS_TOKEN = '${{ secrets.PUSHPLUS_TOKEN }}'" >> info.py
 
     - name: Run main script
       run: python main.py
