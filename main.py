@@ -3,10 +3,25 @@ import feedparser
 import csv
 import re
 import aiohttp
+import os
 from pikpakapi import PikPakApi
 from info import EMAIL, PW, PUSHPLUS_TOKEN
 from torrentool.api import Torrent
 import requests
+
+
+def is_github_actions():
+    """Check if running in GitHub Actions environment"""
+    return os.environ.get('GITHUB_ACTIONS') == 'true'
+
+
+def echo_github_output(message, level="info"):
+    """Format message for GitHub Actions output"""
+    if is_github_actions():
+        prefix = "::{}::".format(level)
+        print(f"{prefix}{message}")
+    else:
+        print(message)
 
 
 async def notify(title, content):
@@ -100,14 +115,18 @@ async def main():
                 for attempt in range(retries):
                     try:
                         task = await client.offline_download(bt_url, parent_id=parent_id)
-                        print(f"已添加到 /Anime/{title}: {file_name}")
+                        success_msg = f"已添加到 /Anime/{title}: {file_name}"
+                        echo_github_output(success_msg)
                         # Add to the list of added files for notification
                         added_files.append(f"[{title}] {file_name}")
                         return
                     except Exception as e:
-                        print(f"失败 (尝试 {attempt + 1}/{retries}): {e}")
+                        error_msg = f"失败 (尝试 {attempt + 1}/{retries}): {e}"
                         if attempt + 1 == retries:
-                            print(f"最终失败: {e}")
+                            error_msg = f"最终失败: {e}"
+                            echo_github_output(error_msg, "error")
+                        else:
+                            echo_github_output(error_msg, "warning")
 
             await retry_offline_download(bt_url, target_folder_id)
 
@@ -120,6 +139,18 @@ async def main():
         notification_title = f"新添加了 {len(added_files)} 个动漫文件"
         notification_content = "\n".join(added_files)
         await notify(notification_title, notification_content)
+        
+        # Echo summary to GitHub Actions log
+        summary = "\n".join([
+            "## 🎬 动漫文件下载摘要",
+            f"### 已添加 {len(added_files)} 个新文件:",
+            "```",
+            "\n".join(added_files),
+            "```"
+        ])
+        echo_github_output(summary)
+    else:
+        echo_github_output("## 🎬 动漫文件下载摘要\n### 本次运行没有添加新文件")
 
 if __name__ == "__main__":
     asyncio.run(main())
