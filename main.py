@@ -87,8 +87,7 @@ async def main():
 
             try:
                 files_in_folder = await client.file_list(parent_id=target_folder_id)
-                existing_files = [f["name"] for f in files_in_folder.get("files", []) 
-                                if f.get("kind") != "drive#folder"]
+                existing_files = [f["name"] for f in files_in_folder.get("files", [])]
                 if file_name in existing_files:
                     print(f"文件已存在，跳过：{file_name}")
                     return
