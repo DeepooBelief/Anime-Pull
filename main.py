@@ -34,14 +34,28 @@ async def main():
 
     async def get_or_create_folder(parent_id, folder_name):
         folder_name = sanitize_folder_name(folder_name)
-        if parent_id == "root":
+        # Ensure parent_id is None when referring to root
+        if parent_id == "root" or parent_id == "" or parent_id is None:
             parent_id = None
-        files = await client.file_list(parent_id=parent_id)
-        for f in files.get("files", []):
-            if f["name"] == folder_name and f["kind"] == "drive#folder":
-                return f["id"]
-        new_folder = await client.create_folder(name=folder_name, parent_id=parent_id)
-        return new_folder["file"]["id"]
+        
+        # Add retry logic for API calls
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                files = await client.file_list(parent_id=parent_id)
+                for f in files.get("files", []):
+                    if f["name"] == folder_name and f["kind"] == "drive#folder":
+                        return f["id"]
+                # Folder not found, create it
+                new_folder = await client.create_folder(name=folder_name, parent_id=parent_id)
+                return new_folder["file"]["id"]
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    print(f"Folder operation failed (attempt {attempt+1}/{max_retries}): {e}")
+                    await asyncio.sleep(1)  # Wait a bit before retrying
+                else:
+                    print(f"Failed to access or create folder '{folder_name}' after {max_retries} attempts: {e}")
+                    raise
 
     def sanitize_folder_name(name):
         return re.sub(r'[\\/:*?"<>|]', '_', name).strip()
@@ -105,7 +119,9 @@ async def main():
                         return
                     except Exception as e:
                         print(f"失败 (尝试 {attempt + 1}/{retries}): {e}")
-                        if attempt + 1 == retries:
+                        if attempt + 1 < retries:
+                            await asyncio.sleep(1)  # Add delay between retries
+                        else:
                             print(f"最终失败: {e}")
 
             await retry_offline_download(bt_url, target_folder_id)
