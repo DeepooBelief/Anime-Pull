@@ -33,6 +33,7 @@ async def main():
     await client.refresh_access_token()
     
     added_files = []  # Track newly added files for notification
+    processed_files = set()  # Track files processed in this session to avoid duplicates
 
     async def get_or_create_folder(parent_id, folder_name):
         folder_name = sanitize_folder_name(folder_name)
@@ -87,6 +88,7 @@ async def main():
 
     # Collect all RSS data from seasonal CSV files
     rss_data = []
+    rss_seen = set()  # Track seen RSS feeds to avoid duplicates
     csv_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
     
     # If no seasonal files exist but the old data.csv exists, use it as fallback
@@ -94,7 +96,12 @@ async def main():
         print("No seasonal data files found. Using legacy data.csv as fallback.")
         with open("data.csv", newline='', encoding='utf-8') as file:
             reader = csv.reader(file)
-            rss_data = [(row[0], row[1]) for row in reader if len(row) >= 2]
+            for row in reader:
+                if len(row) >= 2:
+                    title, rss_url = row[0], row[1]
+                    if (title, rss_url) not in rss_seen:
+                        rss_data.append((title, rss_url))
+                        rss_seen.add((title, rss_url))
     else:
         # Read from all seasonal CSV files
         for csv_file in csv_files:
@@ -102,20 +109,33 @@ async def main():
             print(f"Reading data from {season_path}")
             with open(season_path, newline='', encoding='utf-8') as file:
                 reader = csv.reader(file)
-                season_data = [(row[0], row[1]) for row in reader if len(row) >= 2]
-                rss_data.extend(season_data)
+                for row in reader:
+                    if len(row) >= 2:
+                        title, rss_url = row[0], row[1]
+                        if (title, rss_url) not in rss_seen:
+                            rss_data.append((title, rss_url))
+                            rss_seen.add((title, rss_url))
+                            print(f"  添加RSS: {title}")
+                        else:
+                            print(f"  跳过重复RSS: {title}")
         
         if not rss_data:
             print("No anime data found in seasonal files.")
+        else:
+            print(f"总共找到 {len(rss_data)} 个唯一的RSS源")
 
     async def process_rss(title, rss_url):
         print(f"\n处理 RSS: {title}")
         feed = feedparser.parse(rss_url)
         anime_root_id = await get_or_create_folder("root", "Anime")
         target_folder_id = await get_or_create_folder(anime_root_id, title)
+        
+        # Create a semaphore to limit concurrent downloads for this RSS feed
+        download_semaphore = asyncio.Semaphore(2)  # Limit to 2 concurrent downloads per RSS
 
         async def process_entry(entry):
-            bt_url = None
+            async with download_semaphore:  # Acquire semaphore before processing
+                bt_url = None
             for enc in entry.get('enclosures', []):
                 if enc.get('type') == 'application/x-bittorrent':
                     bt_url = enc.href
@@ -132,6 +152,15 @@ async def main():
                 torrent_data = await fetch_torrent(bt_url)
                 torrent = Torrent.from_string(torrent_data)
                 file_name = torrent.name
+                
+                # Create a unique identifier for this file
+                file_identifier = f"{title}:{file_name}"
+                if file_identifier in processed_files:
+                    print(f"文件在本次会话中已处理，跳过：{file_name}")
+                    return
+                
+                processed_files.add(file_identifier)
+                
             except Exception as e:
                 print(f"解析种子失败: {e}")
                 return
@@ -139,9 +168,26 @@ async def main():
             try:
                 files_in_folder = await client.file_list(parent_id=target_folder_id)
                 existing_files = [f["name"] for f in files_in_folder.get("files", [])]
-                if file_name in existing_files:
-                    print(f"文件已存在，跳过：{file_name}")
+                
+                # More thorough file existence check
+                file_exists = False
+                for existing_file in existing_files:
+                    if existing_file == file_name:
+                        file_exists = True
+                        break
+                    # Also check for similar names (in case of encoding differences)
+                    if existing_file.strip() == file_name.strip():
+                        file_exists = True
+                        break
+                
+                if file_exists:
+                    print(f"文件已存在于PikPak，跳过：{file_name}")
+                    print(f"  现有文件列表中的匹配项：{[f for f in existing_files if file_name.lower() in f.lower() or f.lower() in file_name.lower()]}")
                     return
+                else:
+                    print(f"文件不存在，准备下载：{file_name}")
+                    print(f"  目标文件夹中现有 {len(existing_files)} 个文件")
+                    
             except Exception as e:
                 print(f"检查文件存在失败: {e}")
                 return
@@ -149,19 +195,53 @@ async def main():
             async def retry_offline_download(bt_url, parent_id, retries=3):
                 for attempt in range(retries):
                     try:
+                        print(f"尝试下载 (第 {attempt + 1} 次): {file_name}")
                         task = await client.offline_download(bt_url, parent_id=parent_id)
-                        print(f"已添加到 /Anime/{title}: {file_name}")
+                        print(f"✓ 成功添加到 /Anime/{title}: {file_name}")
+                        print(f"  任务信息: {task}")
                         # Add to the list of added files for notification
                         added_files.append(f"[{title}] {file_name}")
-                        return
+                        return True
                     except Exception as e:
-                        print(f"失败 (尝试 {attempt + 1}/{retries}): {e}")
-                        if attempt + 1 < retries:
-                            await asyncio.sleep(1)  # Add delay between retries
+                        error_msg = str(e).lower()
+                        print(f"✗ 下载失败 (尝试 {attempt + 1}/{retries}): {e}")
+                        
+                        # Check for specific error types
+                        if any(keyword in error_msg for keyword in ["already exists", "duplicate", "existed", "重复"]):
+                            print(f"  → 文件已存在于PikPak中，跳过...")
+                            return False
+                        elif any(keyword in error_msg for keyword in ["rate limit", "too many", "频率", "限制"]):
+                            print(f"  → 遇到频率限制，延长等待时间...")
+                            if attempt + 1 < retries:
+                                await asyncio.sleep(5)  # Longer delay for rate limiting
+                            continue
+                        elif any(keyword in error_msg for keyword in ["network", "timeout", "connection", "网络", "超时"]):
+                            print(f"  → 网络问题，稍后重试...")
+                            if attempt + 1 < retries:
+                                await asyncio.sleep(3)
+                            continue
+                        elif any(keyword in error_msg for keyword in ["auth", "login", "token", "认证", "登录"]):
+                            print(f"  → 认证问题，尝试重新登录...")
+                            try:
+                                await client.login()
+                                await client.refresh_access_token()
+                                if attempt + 1 < retries:
+                                    await asyncio.sleep(1)
+                                continue
+                            except:
+                                print(f"  → 重新登录失败")
+                                return False
                         else:
-                            print(f"最终失败: {e}")
+                            print(f"  → 未知错误类型")
+                            if attempt + 1 < retries:
+                                await asyncio.sleep(2)
+                            else:
+                                print(f"  最终失败: {e}")
+                                return False
 
-            await retry_offline_download(bt_url, target_folder_id)
+            success = await retry_offline_download(bt_url, target_folder_id)
+            if not success:
+                print(f"跳过文件: {file_name}")
 
         await asyncio.gather(*(process_entry(entry) for entry in feed.entries))
 
