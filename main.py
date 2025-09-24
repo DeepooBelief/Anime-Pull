@@ -63,11 +63,50 @@ async def main():
     def sanitize_folder_name(name):
         return re.sub(r'[\\/:*?"<>|]', '_', name).strip()
 
-    async def fetch_torrent(bt_url):
-        async with aiohttp.ClientSession() as session:
-            async with session.get(bt_url) as response:
-                response.raise_for_status()
-                return await response.read()
+    async def fetch_torrent(bt_url, max_retries=3):
+        """Fetch torrent file with proper timeout and retry logic"""
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)  # 30s total, 10s connect
+        
+        for attempt in range(max_retries):
+            try:
+                connector = aiohttp.TCPConnector(
+                    limit=100,  # Connection pool limit
+                    limit_per_host=10,  # Per-host connection limit
+                    ttl_dns_cache=300,  # DNS cache TTL
+                    use_dns_cache=True,
+                )
+                
+                async with aiohttp.ClientSession(
+                    timeout=timeout,
+                    connector=connector,
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    }
+                ) as session:
+                    async with session.get(bt_url) as response:
+                        response.raise_for_status()
+                        return await response.read()
+                        
+            except asyncio.TimeoutError:
+                print(f"Timeout fetching (attempt {attempt + 1}/{max_retries}): {bt_url}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                else:
+                    raise asyncio.TimeoutError(f"Timeout fetching: {bt_url}")
+                    
+            except aiohttp.ClientError as e:
+                print(f"Client error fetching (attempt {attempt + 1}/{max_retries}): {bt_url} - {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    raise
+                    
+            except Exception as e:
+                print(f"Unexpected error fetching (attempt {attempt + 1}/{max_retries}): {bt_url} - {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    raise
 
     # Create data directory if it doesn't exist
     data_dir = "data"
@@ -123,15 +162,20 @@ async def main():
             print("No anime data found in seasonal files.")
         else:
             print(f"总共找到 {len(rss_data)} 个唯一的RSS源")
+            print("开始处理RSS源...")
+
+    # Create a global semaphore to limit overall concurrent torrent fetches
+    global_fetch_semaphore = asyncio.Semaphore(5)  # Limit to 5 concurrent torrent fetches globally
 
     async def process_rss(title, rss_url):
-        print(f"\n处理 RSS: {title}")
+        print(f"\n处理 {title}: ", end="", flush=True)
         feed = feedparser.parse(rss_url)
+        print(f"{len(feed.entries)} 个条目")
         anime_root_id = await get_or_create_folder("root", "Anime")
         target_folder_id = await get_or_create_folder(anime_root_id, title)
         
         # Create a semaphore to limit concurrent downloads for this RSS feed
-        download_semaphore = asyncio.Semaphore(2)  # Limit to 2 concurrent downloads per RSS
+        download_semaphore = asyncio.Semaphore(1)  # Reduced to 1 concurrent download per RSS to be more conservative
 
         async def process_entry(entry):
             async with download_semaphore:  # Acquire semaphore before processing
@@ -149,9 +193,11 @@ async def main():
                 return
 
             try:
-                torrent_data = await fetch_torrent(bt_url)
-                torrent = Torrent.from_string(torrent_data)
-                file_name = torrent.name
+                # Use global semaphore to limit concurrent torrent fetches
+                async with global_fetch_semaphore:
+                    torrent_data = await fetch_torrent(bt_url)
+                    torrent = Torrent.from_string(torrent_data)
+                    file_name = torrent.name
                 
                 # Create a unique identifier for this file
                 file_identifier = f"{title}:{file_name}"
@@ -161,6 +207,12 @@ async def main():
                 
                 processed_files.add(file_identifier)
                 
+            except asyncio.TimeoutError:
+                print(f"种子下载超时，跳过: {bt_url}")
+                return
+            except aiohttp.ClientError as e:
+                print(f"网络错误，跳过种子: {bt_url} - {e}")
+                return
             except Exception as e:
                 print(f"解析种子失败: {e}")
                 return
@@ -246,7 +298,10 @@ async def main():
         await asyncio.gather(*(process_entry(entry) for entry in feed.entries))
 
     if rss_data:
+        start_time = datetime.now()
         await asyncio.gather(*(process_rss(title, rss_url) for title, rss_url in rss_data))
+        end_time = datetime.now()
+        print(f"\n处理完成，耗时: {end_time - start_time}")
     else:
         print("No anime data found to process.")
     
